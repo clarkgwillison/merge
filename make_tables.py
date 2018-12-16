@@ -5,12 +5,30 @@ import os.path
 import shlex
 import codecs
 import sqlite3
+import fnmatch
 import threading
 import subprocess
+
 
 DD_BLKSIZE = 512
 MAX_BLOCKS = 20480
 MAX_FILE_SIZE = DD_BLKSIZE*MAX_BLOCKS
+
+
+ignore = {
+    '.DS_Store',
+    '.sync*',
+    '*Thumbs.db',
+}
+
+
+def is_ignored(rel_fname):
+    """Return True if the file should be ignored"""
+    for pattern in ignore:
+        if fnmatch.fnmatch(rel_fname, pattern):
+            return True
+    return False
+
 
 def get_hash(filename):
     "Get the SHA256 hash of the first 10MB of a file"
@@ -36,6 +54,10 @@ def grok_dir(the_dir, db_name, table):
         for name in files:
             full_name = os.path.join(root, name)
             relpath = os.path.relpath(full_name, start=the_dir)
+            if is_ignored(relpath):
+                print("Skipping file: {}".format(relpath))
+                continue
+
             file_hash = get_hash(os.path.join(the_dir, relpath))
 
             print("Read file: %r" % (full_name,))
@@ -57,12 +79,14 @@ def db_setup(db_file=":memory:"):
     return conn, cursor
 
 
-def db_query_missing(c, ignore_paths=[]):
+def db_query_missing(c, ignore_paths=[], a_only=False):
     """
     Find files that are missing from one or another directory
 
     Uses the file hahshes, so isn't fooled by files that are just moved
     Ignores paths in ignore_paths (good for skipping files that changed)
+
+    If a_only supplied, only return the ones missing from directory A
     """
     query = '''SELECT substr(hash, 0, 20) AS short_hash, start_dir, relpath
                     FROM {1}
@@ -73,6 +97,8 @@ def db_query_missing(c, ignore_paths=[]):
 
     c.execute(query.format("a_files", "b_files"))
     not_in_a = c.fetchall()
+    if a_only:
+        return not_in_a
 
     c.execute(query.format("b_files", "a_files"))
     return not_in_a + c.fetchall()
@@ -119,9 +145,9 @@ def db_query_changed(c):
     return c.fetchall()
 
 
-def db_full_report(c):
+def db_full_report(c, to_a_only=False):
     changed = db_query_changed(c)
-    missing = db_query_missing(c, ignore_paths=[path for _,_,path in changed])
+    missing = db_query_missing(c, ignore_paths=[path for _,_,path in changed], a_only=to_a_only)
     moved = db_query_moved(c)
     duplicates = db_query_duplicates(c)
     print("Moved:\n\t" +      "\n\t".join(map(str, moved)))
@@ -146,13 +172,24 @@ def populate_new_db(db_name, dir_a, dir_b):
 def choose_one(choices):
     """
     Prompt the user to choose among a list of choices
+
+    Takes a list of choices, returns a list of all the ones
+    that should be removed
     """
+    print("\n\nWhich one should we keep?")
     for n,path in enumerate(choices):
         print("{} - {}".format(n+1, path))
-
+    print("(all - 'a', none - 'n')")
     while True:
+        cmd = input("?: ")
+        if cmd == 'a':
+            return []
+        if cmd == 'n':
+            return choices
         try:
-            return choices[int(input("?: "))-1]
+            idx = int(cmd) - 1
+            choices.remove(choices[idx])
+            return choices
         except (ValueError, IndexError):
             print("Didn't catch that...")
 
@@ -175,9 +212,8 @@ def create_dedup_script(duplicates):
     for short_hash, start_dir, relpath in duplicates:
         if current_hash != short_hash:
             # we've changed hashes - lets ask the user what to do with the list we have
-            print("\n\nWhich one should we keep?")
-            dupes_for_hash.remove(choose_one(dupes_for_hash))
-            for fname in dupes_for_hash:
+            remove_these = choose_one(dupes_for_hash)
+            for fname in remove_these:
                 script.write(bytes("rm {}\n".format(shlex.quote(fname)), "utf-8"))
 
             # reset for the next hash
@@ -186,9 +222,6 @@ def create_dedup_script(duplicates):
 
         dupes_for_hash.append(os.path.join(start_dir, relpath))
 
-    script.seek(0)
-    print("Contents of dedup.sh:")
-    print(script.read())
     script.close()
 
 
@@ -218,14 +251,12 @@ def create_sync_script(missing_files, top_dirs):
         # from start_dir to the_other_dir
         if cur_dir != start_dir:
             cmd = "cd {}\n".format(shlex.quote(start_dir))
-            print(cmd)
             script.write(bytes(cmd, "utf-8"))
             cur_dir = start_dir
             to_path = shlex.quote(the_other_dir(start_dir))
 
         from_path = shlex.quote(relpath)
         cmd = "cp -v --parents {} {}\n".format(from_path, to_path)
-        print(cmd)
         script.write(bytes(cmd, "utf-8"))
 
     script.close()
@@ -241,7 +272,10 @@ def get_dirs(c):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="""
+            Analyze the contents of two directories to help merge them in the
+            presence of additions, deletions, duplicates, and potential movements
+            """)
     parser.add_argument("--db", required=True,
         help="Name of the database file to use")
     parser.add_argument("dir_a", nargs="?",
@@ -252,6 +286,8 @@ if __name__ == "__main__":
         help="Create a script to resolve duplicates")
     parser.add_argument("--sync", action="store_true",
         help="Create a script to resolve differences (missing files)")
+    parser.add_argument("--consolidate", action="store_true",
+        help="Create a script to consolidate files into dir_a")
     args = parser.parse_args()
 
     was_pre_existing = os.path.isfile(args.db)
@@ -259,12 +295,12 @@ if __name__ == "__main__":
     if not was_pre_existing:
         populate_new_db(args.db, args.dir_a, args.dir_b)
 
-    report = db_full_report(c)
+    report = db_full_report(c, to_a_only=args.consolidate)
 
     if args.dedup:
         create_dedup_script(report['duplicates'])
 
-    if args.sync:
+    if args.sync or args.consolidate:
         create_sync_script(report['missing'], get_dirs(c))
 
     conn.close()

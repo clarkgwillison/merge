@@ -262,21 +262,21 @@ def create_sync_script(missing_files, top_dirs):
         """).lstrip())
 
     # write the commands that copy files from A to B
-    write_cmd("cd $A")
+    write_cmd('cd "$A"')
     for _,start_dir,relpath in missing_files:
         if start_dir != dir_alias["A"]:
             continue
         write_cmd(f"$CMD {shlex.quote(relpath)} $B")
 
     # write the commands that copy files from B to A
-    write_cmd("cd $B")
+    write_cmd('cd "$B"')
     for _,start_dir,relpath in missing_files:
         if start_dir != dir_alias["B"]:
             continue
         write_cmd(f"$CMD {shlex.quote(relpath)} $A")
 
     # close out the script
-    write_cmd("cd $RET_DIR")
+    write_cmd('cd "$RET_DIR"')
     script.close()
     make_executable("sync.sh")
     print(f"Wrote {len(missing_files)} commands to sync.sh")

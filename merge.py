@@ -8,6 +8,7 @@ import sqlite3
 import fnmatch
 import threading
 import subprocess
+from textwrap import dedent
 
 
 DD_BLKSIZE = 512
@@ -42,6 +43,12 @@ def get_hash(filename):
                                         shell=True, stderr=subprocess.DEVNULL)
 
     return res.split()[0].decode("ASCII")
+
+
+def make_executable(path):
+    mode = os.stat(path).st_mode
+    mode |= (mode & 0o444) >> 2    # copy R bits to X
+    os.chmod(path, mode)
 
 
 def grok_dir(the_dir, db_name, table):
@@ -150,10 +157,6 @@ def db_full_report(c, to_a_only=False):
     missing = db_query_missing(c, ignore_paths=[path for _,_,path in changed], a_only=to_a_only)
     moved = db_query_moved(c)
     duplicates = db_query_duplicates(c)
-    print("Moved:\n\t" +      "\n\t".join(map(str, moved)))
-    print("Changed:\n\t" +    "\n\t".join(map(str, changed)))
-    print("Missing:\n\t" +    "\n\t".join(map(str, missing)))
-    print("Duplicates:\n\t" + "\n\t".join(map(str, duplicates)))
     return {"changed":changed, "missing":missing,
         "moved":moved, "duplicates":duplicates}
 
@@ -239,27 +242,44 @@ def create_sync_script(missing_files, top_dirs):
 
     assert len(top_dirs) == 2, "Please feed 2 top_dirs to create_sync_script()"
 
-    def the_other_dir(this_dir):
-        return top_dirs[(top_dirs.index(this_dir)+1)%2]
+    dir_alias = {
+        "A": top_dirs[1],
+        "B": top_dirs[0],
+    }
 
     script = open("sync.sh", "wb")
     script.write(codecs.BOM_UTF8)
-    script.write(bytes("#! /bin/bash\n", "utf-8"))
-    cur_dir, to_path = "", ""
 
+    def write_cmd(cmd):
+        script.write(bytes(cmd + "\n", "utf-8"))
+
+    write_cmd(dedent(f"""
+        #! /bin/bash
+        A={shlex.quote(dir_alias["A"])}
+        B={shlex.quote(dir_alias["B"])}
+        CMD='cp -v --parents'
+        RET_DIR=$(pwd)
+        """).lstrip())
+
+    # write the commands that copy files from A to B
+    write_cmd("cd $A")
     for _,start_dir,relpath in missing_files:
-        # from start_dir to the_other_dir
-        if cur_dir != start_dir:
-            cmd = "cd {}\n".format(shlex.quote(start_dir))
-            script.write(bytes(cmd, "utf-8"))
-            cur_dir = start_dir
-            to_path = shlex.quote(the_other_dir(start_dir))
+        if start_dir != dir_alias["A"]:
+            continue
+        write_cmd(f"$CMD {shlex.quote(relpath)} $B")
 
-        from_path = shlex.quote(relpath)
-        cmd = "cp -v --parents {} {}\n".format(from_path, to_path)
-        script.write(bytes(cmd, "utf-8"))
+    # write the commands that copy files from B to A
+    write_cmd("cd $B")
+    for _,start_dir,relpath in missing_files:
+        if start_dir != dir_alias["B"]:
+            continue
+        write_cmd(f"$CMD {shlex.quote(relpath)} $A")
 
+    # close out the script
+    write_cmd("cd $RET_DIR")
     script.close()
+    make_executable("sync.sh")
+    print(f"Wrote {len(missing_files)} commands to sync.sh")
 
 
 def get_dirs(c):
@@ -282,6 +302,8 @@ if __name__ == "__main__":
         default='/Users/clark/Documents/src/archive_diff/site_a')
     parser.add_argument("dir_b", nargs="?",
         default='/Users/clark/Documents/src/archive_diff/site_b')
+    parser.add_argument("--report", action="store_true",
+        help="Report all the differences found")
     parser.add_argument("--dedup", action="store_true",
         help="Create a script to resolve duplicates")
     parser.add_argument("--sync", action="store_true",
@@ -296,6 +318,12 @@ if __name__ == "__main__":
         populate_new_db(args.db, args.dir_a, args.dir_b)
 
     report = db_full_report(c, to_a_only=args.consolidate)
+
+    if args.report:
+        print("Moved:\n\t" +      "\n\t".join(map(str, report["moved"])))
+        print("Changed:\n\t" +    "\n\t".join(map(str, report["changed"])))
+        print("Missing:\n\t" +    "\n\t".join(map(str, report["missing"])))
+        print("Duplicates:\n\t" + "\n\t".join(map(str, report["duplicates"])))
 
     if args.dedup:
         create_dedup_script(report['duplicates'])

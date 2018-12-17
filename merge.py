@@ -9,6 +9,7 @@ import fnmatch
 import threading
 import subprocess
 from textwrap import dedent
+from collections import OrderedDict
 
 
 DD_BLKSIZE = 512
@@ -141,14 +142,32 @@ def db_query_moved(c):
 
 
 def db_query_duplicates(c, table="a_files"):
-    c.execute('''SELECT substr(hash, 0, 20) AS short_hash, start_dir, relpath
+    """Return a dictionary of duplicate files indexed by hash and
+    ordered by their starting directory
+
+    Returns:
+        { '12afeed843...': ['/path/to/copy.1', '/path/to/copy.2'], ... }
+    """
+    c.execute('''SELECT hash, start_dir, relpath
                     FROM {table}
                     WHERE hash IN (
                         SELECT hash FROM {table}
                             GROUP BY hash
                             HAVING ( COUNT(hash) > 1 ))
-                    ORDER BY short_hash'''.format(table=table))
-    return c.fetchall()
+                    ORDER BY start_dir'''.format(table=table))
+    duplicates = c.fetchall()
+
+    # group the duplicates into buckets by hash, preserving their
+    # ordering by directory
+    # sorting by directory makes it easier to go through by
+    # hand and decide what to do with each file
+    dupes_by_hash = OrderedDict()
+    for short_hash, start_dir, relpath in duplicates:
+        if short_hash not in dupes_by_hash:
+            dupes_by_hash[short_hash] = []
+        dupes_by_hash[short_hash].append(os.path.join(start_dir, relpath))
+
+    return dupes_by_hash
 
 
 def db_query_changed(c):
@@ -210,8 +229,10 @@ def create_dedup_script(duplicates):
     """
     Create a script that will eliminate duplicates by asking the
     user on a case-by-case basis which file to keep
+
+    duplicates is exactly what's returned by db_query_duplicates()
     """
-    if len(duplicates) < 2:
+    if len(duplicates) == 0:
         print("No duplicates found...")
         return
 
@@ -219,22 +240,14 @@ def create_dedup_script(duplicates):
     script.write(codecs.BOM_UTF8)
     script.write(bytes("#! /bin/sh\n", "utf-8"))
 
-    current_hash = duplicates[0][0]
-    dupes_for_hash = []
-    for short_hash, start_dir, relpath in duplicates:
-        if current_hash != short_hash:
-            # we've changed hashes - lets ask the user what to do with the list we have
-            remove_these = choose_one(dupes_for_hash)
-            for fname in remove_these:
-                script.write(bytes("rm {}\n".format(shlex.quote(fname)), "utf-8"))
-
-            # reset for the next hash
-            dupes_for_hash = []
-            current_hash = short_hash
-
-        dupes_for_hash.append(os.path.join(start_dir, relpath))
+    for short_hash, dupes in duplicates.items():
+        # ask the user what to do with the list we have
+        remove_these = choose_one(dupes)
+        for fname in remove_these:
+            script.write(bytes("rm {}\n".format(shlex.quote(fname)), "utf-8"))
 
     script.close()
+    make_executable("dedup.sh")
 
 
 def create_sync_script(missing_files, top_dirs):

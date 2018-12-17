@@ -37,10 +37,19 @@ def get_hash(filename):
     if os.stat(filename).st_size < MAX_FILE_SIZE:
         res = subprocess.check_output(['shasum','-a','256',filename])
     else:
-        safe = shlex.quote(filename)
-        res = subprocess.check_output("dd if={} count={} | shasum -a 256"
-                                        .format(safe, MAX_BLOCKS),
-                                        shell=True, stderr=subprocess.DEVNULL)
+        p1 = subprocess.Popen(
+            ["dd", f"if={filename}", f"count={MAX_BLOCKS}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        p2 = subprocess.Popen(
+            ["shasum", "-a", "256"],
+            stdin=p1.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        p1.stdout.close()
+        res = p2.communicate()[0]
 
     return res.split()[0].decode("ASCII")
 

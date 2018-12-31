@@ -82,10 +82,10 @@ def grok_dir(the_dir, db_name, table, get_hashes=True):
                 print(f"Checked file size: {full_name}")
                 file_hash = ''
 
-            cursor.execute(f"""
-                INSERT INTO '{table}'
-                VALUES ('{file_hash}', '{file_size}', '{the_dir}', '{relpath}')
-                """)
+            cursor.execute(
+                f"INSERT INTO {table} VALUES (?, ?, ?, ?)",
+                (file_hash, file_size, the_dir, relpath)
+            )
             conn.commit()
 
 
@@ -112,12 +112,16 @@ def db_query_missing(c, ignore_paths=[], a_only=False):
 
     If a_only supplied, only return the ones missing from directory A
     """
+    c.execute("CREATE TEMP TABLE IF NOT EXISTS ignore_paths (relpath text)")
+    if len(ignore_paths) > 0:
+        c.executemany("INSERT INTO ignore_paths VALUES (?)", [(p, ) for p in ignore_paths])
+
+
     query = '''SELECT substr(hash, 0, 20) AS short_hash, start_dir, relpath
                     FROM {1}
-                    WHERE {1}.hash NOT IN (SELECT hash FROM {0})'''
-
-    if len(ignore_paths) > 0:
-        query += " AND {1}.relpath NOT IN ('" + "','".join(ignore_paths) + "')"
+                    WHERE {1}.hash NOT IN (SELECT hash FROM {0})
+                        AND {1}.relpath NOT IN (SELECT relpath FROM ignore_paths)
+                    '''
 
     c.execute(query.format("a_files", "b_files"))
     not_in_a = c.fetchall()
@@ -156,13 +160,13 @@ def db_query_duplicates(c, table="a_files"):
     Returns:
         { '12afeed843...': ['/path/to/copy.1', '/path/to/copy.2'], ... }
     """
-    c.execute('''SELECT hash, start_dir, relpath
+    c.execute(f"""SELECT hash, start_dir, relpath
                     FROM {table}
                     WHERE hash IN (
                         SELECT hash FROM {table}
                             GROUP BY hash
                             HAVING ( COUNT(hash) > 1 ))
-                    ORDER BY start_dir'''.format(table=table))
+                    ORDER BY start_dir""")
     duplicates = c.fetchall()
 
     # group the duplicates into buckets by hash, preserving their
@@ -360,11 +364,11 @@ def populate_db_for_absorb(db_file, dir_a, dir_b):
         full_path = os.path.join(start_dir, relpath)
         print(f"Hashing file: {full_path}")
         file_hash = get_hash(full_path)
-        cursor.execute(f"""
+        cursor.execute("""
             UPDATE a_files
-            SET hash = '{file_hash}'
-            WHERE start_dir = '{start_dir}' AND relpath = '{relpath}'
-        """)
+            SET hash = ?
+            WHERE start_dir = ? AND relpath = ?
+        """, (file_hash, start_dir, relpath))
         conn.commit()
 
 

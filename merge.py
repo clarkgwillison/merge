@@ -250,7 +250,7 @@ def create_dedup_script(duplicates):
     make_executable("dedup.sh")
 
 
-def create_sync_script(missing_files, top_dirs):
+def create_sync_script(missing_files, top_dirs, copy=True):
     """
     Create a script that syncs missing files from one location to another
 
@@ -279,23 +279,34 @@ def create_sync_script(missing_files, top_dirs):
         #! /bin/bash
         A={shlex.quote(dir_alias["A"])}
         B={shlex.quote(dir_alias["B"])}
-        CMD='cp -v --parents'
         RET_DIR=$(pwd)
-        """).lstrip())
+        """).strip())
+    if copy:
+        write_cmd("CMD='cp -v --parents'")
+    else:
+        write_cmd("CMD='mv'")
 
     # write the commands that copy files from A to B
     write_cmd('cd "$A"')
     for _,start_dir,relpath in missing_files:
         if start_dir != dir_alias["A"]:
             continue
-        write_cmd(f"$CMD {shlex.quote(relpath)} $B")
+        if copy:
+            write_cmd(f"$CMD {shlex.quote(relpath)} $B")
+        else:
+            dirname = os.path.dirname(relpath)
+            write_cmd(f'mkdir -p "$B/{dirname}" && $CMD "{relpath}" "$B/{relpath}"')
 
     # write the commands that copy files from B to A
     write_cmd('cd "$B"')
     for _,start_dir,relpath in missing_files:
         if start_dir != dir_alias["B"]:
             continue
-        write_cmd(f"$CMD {shlex.quote(relpath)} $A")
+        if copy:
+            write_cmd(f'$CMD {shlex.quote(relpath)} $A')
+        else:
+            dirname = os.path.dirname(relpath)
+            write_cmd(f'mkdir -p "$A/{dirname}" && $CMD "{relpath}" "$A/{relpath}"')
 
     # close out the script
     write_cmd('cd "$RET_DIR"')
@@ -330,6 +341,8 @@ if __name__ == "__main__":
         help="Create a script to resolve duplicates")
     parser.add_argument("--sync", action="store_true",
         help="Create a script to resolve differences (missing files)")
+    parser.add_argument("--move", action="store_true",
+        help="When creating a sync script, make commands to move files not copy them")
     parser.add_argument("--consolidate", action="store_true",
         help="Create a script to consolidate files into dir_a")
     args = parser.parse_args()
@@ -345,12 +358,15 @@ if __name__ == "__main__":
         print("Moved:\n\t" +      "\n\t".join(map(str, report["moved"])))
         print("Changed:\n\t" +    "\n\t".join(map(str, report["changed"])))
         print("Missing:\n\t" +    "\n\t".join(map(str, report["missing"])))
-        print("Duplicates:\n\t" + "\n\t".join(map(str, report["duplicates"])))
+        print("Duplicates:")
+        for hash_str, file_list in report["duplicates"].items():
+            print(f"\t{hash_str}")
+            print("\t\t" + "\n\t\t".join(map(str, file_list)))
 
     if args.dedup:
         create_dedup_script(report['duplicates'])
 
     if args.sync or args.consolidate:
-        create_sync_script(report['missing'], get_dirs(c))
+        create_sync_script(report['missing'], get_dirs(c), copy=not args.move)
 
     conn.close()

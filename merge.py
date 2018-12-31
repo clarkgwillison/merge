@@ -33,8 +33,7 @@ def is_ignored(rel_fname):
 
 
 def get_hash(filename):
-    "Get the SHA256 hash of the first 10MB of a file"
-
+    """Get the SHA256 hash of the first 10MB of a file"""
     if os.stat(filename).st_size < MAX_FILE_SIZE:
         res = subprocess.check_output(['shasum','-a','256',filename])
     else:
@@ -61,24 +60,32 @@ def make_executable(path):
     os.chmod(path, mode)
 
 
-def grok_dir(the_dir, db_name, table):
+def grok_dir(the_dir, db_name, table, get_hashes=True):
     conn = sqlite3.connect(db_name)
     cursor = conn.cursor()
-
-    sql = "INSERT INTO {!s} VALUES ({!r}, {!r}, {!r})"
 
     for root, dirs, files in os.walk(the_dir):
         for name in files:
             full_name = os.path.join(root, name)
             relpath = os.path.relpath(full_name, start=the_dir)
             if is_ignored(relpath):
-                print("Skipping file: {}".format(relpath))
+                print(f"Skipping file: {relpath}")
                 continue
 
-            file_hash = get_hash(os.path.join(the_dir, relpath))
+            full_path = os.path.join(the_dir, relpath)
+            file_size = os.stat(full_path).st_size
 
-            print("Read file: %r" % (full_name,))
-            cursor.execute(sql.format(table, file_hash, the_dir, relpath))
+            if get_hashes:
+                print(f"Hashing file: {full_name}")
+                file_hash = get_hash(full_path)
+            else:
+                print(f"Checked file size: {full_name}")
+                file_hash = ''
+
+            cursor.execute(f"""
+                INSERT INTO '{table}'
+                VALUES ('{file_hash}', '{file_size}', '{the_dir}', '{relpath}')
+                """)
             conn.commit()
 
 
@@ -87,9 +94,9 @@ def db_setup(db_file=":memory:"):
     cursor = conn.cursor()
 
     cursor.execute('''CREATE TABLE IF NOT EXISTS a_files
-                 (hash text, start_dir text, relpath text)''')
+                 (hash text, size integer, start_dir text, relpath text)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS b_files
-                 (hash text, start_dir text, relpath text)''')
+                 (hash text, size integer, start_dir text, relpath text)''')
 
     conn.commit()
 
@@ -142,7 +149,8 @@ def db_query_moved(c):
 
 
 def db_query_duplicates(c, table="a_files"):
-    """Return a dictionary of duplicate files indexed by hash and
+    """
+    Return a dictionary of duplicate files indexed by hash and
     ordered by their starting directory
 
     Returns:
@@ -171,7 +179,7 @@ def db_query_duplicates(c, table="a_files"):
 
 
 def db_query_changed(c):
-    "Find files that may be changed or corrupted"
+    """Find files that may be changed or corrupted"""
     c.execute('''SELECT substr(a.hash, 0, 20) AS a_short_hash,
                         substr(b.hash, 0, 20) AS b_short_hash, a.relpath AS relpath
                     FROM a_files a, b_files b
@@ -189,9 +197,10 @@ def db_full_report(c, to_a_only=False):
         "moved":moved, "duplicates":duplicates}
 
 
-def populate_new_db(db_name, dir_a, dir_b):
+def populate_new_db(db_name, dir_a, dir_b, get_a_hashes=True):
     a_thread = threading.Thread(target=grok_dir,
-        args=(dir_a, db_name, "a_files"))
+        args=(dir_a, db_name, "a_files"),
+        kwargs={"get_hashes": get_a_hashes})
     b_thread = threading.Thread(target=grok_dir,
         args=(dir_b, db_name, "b_files"))
     a_thread.start()
@@ -322,6 +331,43 @@ def get_dirs(c):
     return [dir_a, c.fetchone()[0]]
 
 
+def populate_db_for_absorb(db_file, dir_a, dir_b):
+    """
+    Absorb all files from dir_b into dir_a, but only if
+    they aren't already in dir_a
+
+    This does it quicker than --consolidate by only hashing
+    those files from dir_a that match the size of those in dir_b
+
+    We default to copying everything from dir_b into dir_a unless
+    we can show that it's already in dir_a
+    """
+    conn, cursor = db_setup(db_file=db_file)
+    populate_new_db(db_file, dir_a, dir_b, get_a_hashes=False)
+
+    # find all files in dir_a that are the same size as ones from dir_b
+    # because we're going to hash only those files next
+    cursor.execute("""
+        SELECT start_dir, relpath
+            FROM a_files
+            WHERE a_files.size IN (SELECT size FROM b_files)
+        """)
+    size_matches = cursor.fetchall()
+
+    print(f"Found {len(size_matches)} files that matched sizes")
+
+    for start_dir, relpath in size_matches:
+        full_path = os.path.join(start_dir, relpath)
+        print(f"Hashing file: {full_path}")
+        file_hash = get_hash(full_path)
+        cursor.execute(f"""
+            UPDATE a_files
+            SET hash = '{file_hash}'
+            WHERE start_dir = '{start_dir}' AND relpath = '{relpath}'
+        """)
+        conn.commit()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -345,14 +391,22 @@ if __name__ == "__main__":
         help="When creating a sync script, make commands to move files not copy them")
     parser.add_argument("--consolidate", action="store_true",
         help="Create a script to consolidate files into dir_a")
+    parser.add_argument("--absorb", action="store_true",
+        help="Create a script to absorb smaller dir_b into dir_a (faster than consolidate)")
     args = parser.parse_args()
 
-    was_pre_existing = os.path.isfile(args.db)
-    conn, c = db_setup(db_file=args.db)
-    if not was_pre_existing:
-        populate_new_db(args.db, args.dir_a, args.dir_b)
+    if args.absorb:
+        args.consolidate = True
 
-    report = db_full_report(c, to_a_only=args.consolidate)
+    was_pre_existing = os.path.isfile(args.db)
+    conn, cursor = db_setup(db_file=args.db)
+    if not was_pre_existing:
+        if args.absorb:
+            populate_db_for_absorb(args.db, args.dir_a, args.dir_b)
+        else:
+            populate_new_db(args.db, args.dir_a, args.dir_b)
+
+    report = db_full_report(cursor, to_a_only=args.consolidate)
 
     if args.report:
         print("Moved:\n\t" +      "\n\t".join(map(str, report["moved"])))
@@ -367,6 +421,6 @@ if __name__ == "__main__":
         create_dedup_script(report['duplicates'])
 
     if args.sync or args.consolidate:
-        create_sync_script(report['missing'], get_dirs(c), copy=not args.move)
+        create_sync_script(report['missing'], get_dirs(cursor), copy=not args.move)
 
     conn.close()

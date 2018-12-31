@@ -3,6 +3,7 @@
 import os
 import os.path
 import shlex
+import queue
 import codecs
 import sqlite3
 import fnmatch
@@ -60,10 +61,7 @@ def make_executable(path):
     os.chmod(path, mode)
 
 
-def grok_dir(the_dir, db_name, table, get_hashes=True):
-    conn = sqlite3.connect(db_name)
-    cursor = conn.cursor()
-
+def grok_dir(the_dir, callbak, get_hashes=True):
     for root, dirs, files in os.walk(the_dir):
         for name in files:
             full_name = os.path.join(root, name)
@@ -82,11 +80,7 @@ def grok_dir(the_dir, db_name, table, get_hashes=True):
                 print(f"Checked file size: {full_name}")
                 file_hash = ''
 
-            cursor.execute(
-                f"INSERT INTO {table} VALUES (?, ?, ?, ?)",
-                (file_hash, file_size, the_dir, relpath)
-            )
-            conn.commit()
+            callbak(file_hash, file_size, the_dir, relpath)
 
 
 def db_setup(db_file=":memory:"):
@@ -201,14 +195,34 @@ def db_full_report(c, to_a_only=False):
         "moved":moved, "duplicates":duplicates}
 
 
-def populate_new_db(db_name, dir_a, dir_b, get_a_hashes=True):
+def populate_new_db(cursor, dir_a, dir_b, get_a_hashes=True):
+    write_queue = queue.Queue()
+
+    def add_to_a(*args):
+        write_queue.put(("a_files", *args))
+
+    def add_to_b(*args):
+        write_queue.put(("b_files", *args))
+
     a_thread = threading.Thread(target=grok_dir,
-        args=(dir_a, db_name, "a_files"),
+        args=(dir_a, add_to_a),
         kwargs={"get_hashes": get_a_hashes})
     b_thread = threading.Thread(target=grok_dir,
-        args=(dir_b, db_name, "b_files"))
+        args=(dir_b, add_to_b))
     a_thread.start()
     b_thread.start()
+
+    while a_thread.is_alive() or b_thread.is_alive():
+        try:
+            table, file_hash, file_size, the_dir, relpath = write_queue.get(timeout=0.05)
+        except queue.Empty:
+            continue
+        cursor.execute(
+            f"INSERT INTO {table} VALUES (?, ?, ?, ?)",
+            (file_hash, file_size, the_dir, relpath)
+        )
+        cursor.connection.commit()
+
     a_thread.join()
     b_thread.join()
 
@@ -335,7 +349,7 @@ def get_dirs(c):
     return [dir_a, c.fetchone()[0]]
 
 
-def populate_db_for_absorb(db_file, dir_a, dir_b):
+def populate_db_for_absorb(cursor, dir_a, dir_b):
     """
     Absorb all files from dir_b into dir_a, but only if
     they aren't already in dir_a
@@ -346,8 +360,7 @@ def populate_db_for_absorb(db_file, dir_a, dir_b):
     We default to copying everything from dir_b into dir_a unless
     we can show that it's already in dir_a
     """
-    conn, cursor = db_setup(db_file=db_file)
-    populate_new_db(db_file, dir_a, dir_b, get_a_hashes=False)
+    populate_new_db(cursor, dir_a, dir_b, get_a_hashes=False)
 
     # find all files in dir_a that are the same size as ones from dir_b
     # because we're going to hash only those files next
@@ -369,7 +382,7 @@ def populate_db_for_absorb(db_file, dir_a, dir_b):
             SET hash = ?
             WHERE start_dir = ? AND relpath = ?
         """, (file_hash, start_dir, relpath))
-        conn.commit()
+        cursor.connection.commit()
 
 
 if __name__ == "__main__":
@@ -406,9 +419,9 @@ if __name__ == "__main__":
     conn, cursor = db_setup(db_file=args.db)
     if not was_pre_existing:
         if args.absorb:
-            populate_db_for_absorb(args.db, args.dir_a, args.dir_b)
+            populate_db_for_absorb(cursor, args.dir_a, args.dir_b)
         else:
-            populate_new_db(args.db, args.dir_a, args.dir_b)
+            populate_new_db(cursor, args.dir_a, args.dir_b)
 
     report = db_full_report(cursor, to_a_only=args.consolidate)
 

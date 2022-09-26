@@ -2,6 +2,7 @@
 
 import os
 import os.path
+import platform
 import shlex
 import queue
 import codecs
@@ -303,13 +304,16 @@ def create_sync_script(missing_files, top_dirs, copy=True):
         script.write(bytes(cmd + "\n", "utf-8"))
 
     write_cmd(dedent(f"""
-        #! /bin/bash
+        #! /usr/bin/env sh
         A={shlex.quote(dir_alias["A"])}
         B={shlex.quote(dir_alias["B"])}
         RET_DIR=$(pwd)
         """).strip())
     if copy:
-        write_cmd("CMD='cp -v --parents'")
+        if platform.system() == "Darwin":
+            write_cmd("CMD='ditto -v'")
+        else:
+            write_cmd("CMD='cp -v --parents'")
     else:
         write_cmd("CMD='mv'")
 

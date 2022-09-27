@@ -37,7 +37,7 @@ def is_ignored(rel_fname):
 def get_hash(filename):
     """Get the SHA256 hash of the first 10MB of a file"""
     if os.stat(filename).st_size < MAX_FILE_SIZE:
-        res = subprocess.check_output(['shasum','-a','256',filename])
+        res = subprocess.check_output(['shasum', '-a', '256', filename])
     else:
         p1 = subprocess.Popen(
             ["dd", f"if={filename}", f"count={MAX_BLOCKS}"],
@@ -72,6 +72,12 @@ def grok_dir(the_dir, callbak, get_hashes=True):
                 continue
 
             full_path = os.path.join(the_dir, relpath)
+
+            # skip the file if it's not a regular file (like a symlink)
+            if not os.path.isfile(full_path):
+                print(f"Skipping non-file: {relpath}")
+                continue
+
             file_size = os.stat(full_path).st_size
 
             if get_hashes:
@@ -110,7 +116,6 @@ def db_query_missing(c, ignore_paths=[], a_only=False):
     c.execute("CREATE TEMP TABLE IF NOT EXISTS ignore_paths (relpath text)")
     if len(ignore_paths) > 0:
         c.executemany("INSERT INTO ignore_paths VALUES (?)", [(p, ) for p in ignore_paths])
-
 
     query = '''SELECT substr(hash, 0, 20) AS short_hash, start_dir, relpath
                     FROM {1}
@@ -192,8 +197,8 @@ def db_full_report(c, to_a_only=False):
     missing = db_query_missing(c, ignore_paths=[path for _,_,path in changed], a_only=to_a_only)
     moved = db_query_moved(c)
     duplicates = db_query_duplicates(c)
-    return {"changed":changed, "missing":missing,
-        "moved":moved, "duplicates":duplicates}
+    return {"changed": changed, "missing": missing,
+            "moved": moved, "duplicates": duplicates}
 
 
 def populate_new_db(cursor, dir_a, dir_b, get_a_hashes=True):
@@ -236,7 +241,7 @@ def choose_one(choices):
     that should be removed
     """
     print("\n\nWhich one should we keep?")
-    for n,path in enumerate(choices):
+    for n, path in enumerate(choices):
         print("{} - {}".format(n+1, path))
     print("(all - 'a', none - 'n')")
     while True:
@@ -319,7 +324,7 @@ def create_sync_script(missing_files, top_dirs, copy=True):
 
     # write the commands that copy files from A to B
     write_cmd('cd "$A"')
-    for _,start_dir,relpath in missing_files:
+    for _, start_dir, relpath in missing_files:
         if start_dir != dir_alias["A"]:
             continue
         if copy:
@@ -330,7 +335,7 @@ def create_sync_script(missing_files, top_dirs, copy=True):
 
     # write the commands that copy files from B to A
     write_cmd('cd "$B"')
-    for _,start_dir,relpath in missing_files:
+    for _, start_dir, relpath in missing_files:
         if start_dir != dir_alias["B"]:
             continue
         if copy:

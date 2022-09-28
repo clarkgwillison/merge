@@ -327,8 +327,9 @@ def create_sync_script(missing_files, top_dirs, copy=True):
     for _, start_dir, relpath in missing_files:
         if start_dir != dir_alias["A"]:
             continue
+        full_dest = os.path.join(dir_alias["B"], relpath)
         if copy:
-            write_cmd(f"$CMD {shlex.quote(relpath)} $B")
+            write_cmd(f"$CMD {shlex.quote(relpath)} {shlex.quote(full_dest)}")
         else:
             dirname = os.path.dirname(relpath)
             write_cmd(f'mkdir -p "$B/{dirname}" && $CMD "{relpath}" "$B/{relpath}"')
